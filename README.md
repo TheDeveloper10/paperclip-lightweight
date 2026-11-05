@@ -118,6 +118,42 @@ docker run --rm paperclip-lightweight podman --version
 docker run --rm paperclip-lightweight sh -c '! command -v codex && ! command -v gemini && ! command -v python3'
 ```
 
+## Nightly CI
+
+`.github/workflows/nightly.yml` runs every night (03:17 UTC) and on manual
+dispatch. Each run:
+
+1. Inspects `ghcr.io/paperclipai/paperclip:latest` and records its digest.
+2. Resolves the version tag that points at the same digest. It reads the
+   `org.opencontainers.image.version` label first and falls back to scanning
+   the GHCR tag list for a digest match.
+3. Skips the build if an image for that version was already pushed from the
+   same upstream digest. Dispatch with `force: true` to override.
+4. Builds this Dockerfile with `PAPERCLIP_TAG=<version>` for
+   `linux/amd64,linux/arm64`.
+5. Pushes `<repo>:latest` and `<repo>:<version>`, so the tags mirror upstream.
+
+Required repository secrets:
+
+| Secret | Example | Notes |
+| --- | --- | --- |
+| `REGISTRY_URL` | `docker.io` | Registry host. A scheme or trailing slash is tolerated. |
+| `REGISTRY_USERNAME` | `alice` | Also used as the namespace of the pushed image. |
+| `REGISTRY_TOKEN` | `dckr_pat_...` | Docker Hub access token with write scope, or a password. |
+
+Optional repository variables:
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `IMAGE_NAME` | `paperclip-lightweight` | Repository name under the username. |
+| `PLATFORMS` | `linux/amd64,linux/arm64` | Set to `linux/amd64` to skip the slow QEMU arm64 build. |
+
+The pushed image is `<REGISTRY_URL>/<REGISTRY_USERNAME>/<IMAGE_NAME>`, with
+`docker.io/` stripped for Docker Hub. It carries
+`org.opencontainers.image.base.digest` and
+`io.paperclip-lightweight.upstream-digest` labels pointing at the exact
+upstream build it was made from.
+
 ## Notes and caveats
 
 - The upstream image tag list is not documented in the repo. `latest` is

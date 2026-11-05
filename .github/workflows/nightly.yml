@@ -1,0 +1,186 @@
+name: nightly
+
+on:
+  schedule:
+    # 03:17 UTC every day. Odd minute to dodge the top-of-hour GitHub queue.
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Rebuild even if the upstream digest has not changed"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  UPSTREAM_IMAGE: ghcr.io/paperclipai/paperclip
+  # Final image name: <REGISTRY_URL>/<REGISTRY_USERNAME>/<IMAGE_NAME>
+  # e.g. docker.io/alice/paperclip-lightweight
+  IMAGE_NAME: ${{ vars.IMAGE_NAME || 'paperclip-lightweight' }}
+  PLATFORMS: ${{ vars.PLATFORMS || 'linux/amd64,linux/arm64' }}
+
+jobs:
+  resolve:
+    name: Resolve upstream tags
+    runs-on: ubuntu-latest
+    outputs:
+      digest: ${{ steps.upstream.outputs.digest }}
+      version: ${{ steps.upstream.outputs.version }}
+      tags: ${{ steps.upstream.outputs.tags }}
+      changed: ${{ steps.compare.outputs.changed }}
+      target: ${{ steps.target.outputs.repo }}
+    steps:
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Inspect upstream :latest
+        id: upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+          ref="${UPSTREAM_IMAGE}:latest"
+
+          # Manifest-list digest of :latest (what other tags will also point at).
+          digest="$(docker buildx imagetools inspect "$ref" --format '{{ .Manifest.Digest }}')"
+          echo "upstream digest: $digest"
+
+          # First try: OCI version label on the amd64 image config.
+          version="$(docker buildx imagetools inspect "$ref" \
+            --format '{{ index (index .Image "linux/amd64").Config.Labels "org.opencontainers.image.version" }}' 2>/dev/null || true)"
+          version="${version#v}"
+
+          # Fallback: walk the GHCR tag list and find tags sharing the digest.
+          if [ -z "$version" ] || [ "$version" = "<no value>" ]; then
+            echo "no version label, scanning GHCR tags for a digest match"
+            token="$(curl -fsSL "https://ghcr.io/token?scope=repository:paperclipai/paperclip:pull" | jq -r .token)"
+            tags="$(curl -fsSL -H "Authorization: Bearer $token" \
+              "https://ghcr.io/v2/paperclipai/paperclip/tags/list?n=200" | jq -r '.tags[]')"
+            version=""
+            for t in $tags; do
+              case "$t" in latest|sha-*|main|master|nightly|edge) continue ;; esac
+              d="$(curl -fsSI -H "Authorization: Bearer $token" \
+                -H "Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json" \
+                "https://ghcr.io/v2/paperclipai/paperclip/manifests/$t" \
+                | tr -d '\r' | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}')"
+              if [ "$d" = "$digest" ]; then version="$t"; break; fi
+            done
+          fi
+
+          if [ -z "$version" ]; then
+            echo "::error::could not resolve a version tag for ${ref} (${digest})"
+            exit 1
+          fi
+
+          echo "resolved version: $version"
+          echo "digest=$digest"   >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tags=latest,$version" >> "$GITHUB_OUTPUT"
+
+      - name: Compute target repository
+        id: target
+        shell: bash
+        run: |
+          set -euo pipefail
+          registry="${{ secrets.REGISTRY_URL }}"
+          registry="${registry#https://}"; registry="${registry#http://}"; registry="${registry%/}"
+          user="${{ secrets.REGISTRY_USERNAME }}"
+          repo="${registry}/${user}/${IMAGE_NAME}"
+          # docker.io is implicit for Docker Hub; strip it so tags look canonical.
+          repo="${repo#docker.io/}"
+          repo="${repo#index.docker.io/}"
+          echo "repo=$repo" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ secrets.REGISTRY_URL }}
+          username: ${{ secrets.REGISTRY_USERNAME }}
+          password: ${{ secrets.REGISTRY_TOKEN }}
+
+      - name: Skip if already built from this upstream digest
+        id: compare
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ inputs.force }}" = "true" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          ours="${{ steps.target.outputs.repo }}:${{ steps.upstream.outputs.version }}"
+          prev="$(docker buildx imagetools inspect "$ours" \
+            --format '{{ index (index .Image "linux/amd64").Config.Labels "io.paperclip-lightweight.upstream-digest" }}' 2>/dev/null || true)"
+          if [ "$prev" = "${{ steps.upstream.outputs.digest }}" ]; then
+            echo "$ours already built from ${prev}; nothing to do"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    name: Build and push
+    needs: resolve
+    if: needs.resolve.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ secrets.REGISTRY_URL }}
+          username: ${{ secrets.REGISTRY_USERNAME }}
+          password: ${{ secrets.REGISTRY_TOKEN }}
+
+      - name: Image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ needs.resolve.outputs.target }}
+          tags: |
+            type=raw,value=latest
+            type=raw,value=${{ needs.resolve.outputs.version }}
+          labels: |
+            org.opencontainers.image.title=paperclip-lightweight
+            org.opencontainers.image.version=${{ needs.resolve.outputs.version }}
+            org.opencontainers.image.base.name=${{ env.UPSTREAM_IMAGE }}:${{ needs.resolve.outputs.version }}
+            org.opencontainers.image.base.digest=${{ needs.resolve.outputs.digest }}
+            io.paperclip-lightweight.upstream-digest=${{ needs.resolve.outputs.digest }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: ${{ env.PLATFORMS }}
+          push: true
+          pull: true
+          build-args: |
+            PAPERCLIP_TAG=${{ needs.resolve.outputs.version }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Summary
+        shell: bash
+        run: |
+          {
+            echo "### paperclip-lightweight nightly"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| upstream | \`${UPSTREAM_IMAGE}:latest\` |"
+            echo "| upstream digest | \`${{ needs.resolve.outputs.digest }}\` |"
+            echo "| version tag | \`${{ needs.resolve.outputs.version }}\` |"
+            echo "| pushed | \`${{ needs.resolve.outputs.target }}:latest\`, \`${{ needs.resolve.outputs.target }}:${{ needs.resolve.outputs.version }}\` |"
+            echo "| platforms | \`${PLATFORMS}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
